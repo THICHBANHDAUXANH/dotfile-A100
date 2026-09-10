@@ -172,23 +172,43 @@ start_sshd() {
     if ! command -v sshd &>/dev/null; then
         info "sshd not found — installing (apt-get update + openssh-server)..."
         apt-get update -q 2>/dev/null
-        apt-get install -y openssh-server libgl1 libglib2.0-0 default-jdk -q 2>/dev/null
+        apt-get install -y openssh-server libgl1 libglib2.0-0 default-jdk ncat autossh -q 2>/dev/null
     fi
+    # ncat/autossh are needed by start_reverse_tunnel below -- install them
+    # even if sshd was already present (e.g. base image already had sshd).
+    command -v ncat &>/dev/null    || apt-get install -y ncat -q 2>/dev/null
+    command -v autossh &>/dev/null || apt-get install -y autossh -q 2>/dev/null
     mkdir -p /run/sshd
 
-    # Restore authorized_keys từ persistent storage
     mkdir -p /root/.ssh && chmod 700 /root/.ssh
+
+    # Restore authorized_keys từ persistent storage (worker's pubkey --
+    # trusted for the loop-back `ssh -p <port> root@localhost` the worker
+    # does through the reverse tunnel below).
     if [[ -f "$DATA/.ssh_authorized_keys" ]]; then
         cp "$DATA/.ssh_authorized_keys" /root/.ssh/authorized_keys
         chmod 600 /root/.ssh/authorized_keys
+    fi
 
-    # Restore tunnel key (dùng cho reverse tunnel → worker)
-    if [[ -f "$DATA/.ssh/id_ed25519" ]]; then
-        cp "$DATA/.ssh/id_ed25519"     /root/.ssh/id_ed25519     2>/dev/null || true
-        cp "$DATA/.ssh/id_ed25519.pub" /root/.ssh/id_ed25519.pub 2>/dev/null || true
-        chmod 600 /root/.ssh/id_ed25519 2>/dev/null || true
+    # Tunnel key (pod → worker, used by start_reverse_tunnel's autossh).
+    # Generated once and persisted immediately -- if this weren't persisted,
+    # a restart would mint a new key the worker's authorized_keys no longer
+    # trusts, silently breaking the tunnel.
+    mkdir -p "$DATA/.ssh" && chmod 700 "$DATA/.ssh"
+    local tkey="$DATA/.ssh/id_ed25519"
+    if [[ ! -f "$tkey" ]]; then
+        info "Generating tunnel SSH key (ed25519)..."
+        ssh-keygen -t ed25519 -C "tunnel-a100-pod" -f "$tkey" -N "" -q
+        ok "Tunnel key created: $tkey"
+        echo ""
+        echo "  ┌─ Tunnel public key (add to the WORKER's ~/.ssh/authorized_keys) ─"
+        sed 's/^/  │  /' "$tkey.pub"
+        echo "  └───────────────────────────────────────────────────────────────────"
+        echo ""
     fi
-    fi
+    cp "$tkey"     /root/.ssh/id_ed25519     2>/dev/null || true
+    cp "$tkey.pub" /root/.ssh/id_ed25519.pub 2>/dev/null || true
+    chmod 600 /root/.ssh/id_ed25519 2>/dev/null || true
 
     # Restore hoặc gen GitHub SSH key
     mkdir -p "$DATA/.ssh" && chmod 700 "$DATA/.ssh"
@@ -275,22 +295,42 @@ start_tailscale() {
     # so the tailscale state file -- which holds the node's private identity,
     # not just a display name -- MUST be unique per workload. Two containers
     # sharing one state file would both authenticate as the same tailnet
-    # node and fight each other. Key it off TUNNEL_PORT (already required to
-    # be set uniquely per workload) rather than hostname, since hostname
-    # alone doesn't change the underlying node identity in the state file.
+    # node and fight each other. Key it off TUNNEL_PORT when explicitly set;
+    # otherwise use the plain (unsuffixed) state file, since that's what the
+    # original pod already registered under -- renaming it would orphan an
+    # already-authenticated node and force re-auth for no reason.
     local wid="${TUNNEL_PORT:-default}"
-    local state_file="$DATA/tailscale-state-${wid}.json"
+    local state_file
+    if [[ -n "${TUNNEL_PORT:-}" ]]; then
+        state_file="$DATA/tailscale-state-${TUNNEL_PORT}.json"
+    else
+        state_file="$DATA/tailscale-state.json"
+    fi
     # /var/run (where tailscaled's default control socket lives) is
     # per-container, NOT part of the shared host path, so multiple
     # tailscaled instances across workloads don't need separate sockets --
     # only files under $DATA (the actual shared storage) need per-workload
     # names.
     pkill -f "tailscaled.*${state_file}" 2>/dev/null || true; sleep 1
+    # --socks5-server: required. In --tun=userspace-networking mode (no
+    # /dev/net/tun in a container) there is NO kernel route to the tailnet
+    # (100.64.0.0/10) at all -- only tailscaled itself can reach peers. This
+    # local SOCKS5 proxy is the only way anything else (ssh's ProxyCommand
+    # via ncat, in start_reverse_tunnel below) can reach the tailnet.
     tailscaled --tun=userspace-networking --state="$state_file" \
+        --socks5-server=localhost:1055 \
         > "$DATA/tailscaled-${wid}.log" 2>&1 &
     sleep 3
+    # State file already holds a valid node identity from a previous `up`
+    # -> no authkey needed on this and every future restart.
+    if tailscale ip -4 &>/dev/null; then
+        ok "Tailscale already authenticated: $(tailscale ip -4)"
+        return 0
+    fi
     if [[ ! -f "$DATA/.tailscale_authkey" ]]; then
-        warn "No Tailscale auth key at $DATA/.tailscale_authkey"
+        warn "No Tailscale auth key at $DATA/.tailscale_authkey and node not yet authenticated"
+        warn "Get one at https://tailscale.com/settings/keys, then:"
+        warn "  echo 'tskey-auth-...' > $DATA/.tailscale_authkey && bash setup.sh"
         return 1
     fi
     if tailscale up --authkey="$(cat "$DATA/.tailscale_authkey")" \
@@ -307,7 +347,8 @@ start_reverse_tunnel() {
     # Inbound TCP tới Tailscale IP của pod bị timeout (tailscaled chạy
     # userspace-networking, chỉ có DERP relay) — máy ngoài SSH vào pod
     # qua reverse tunnel này: trên worker chạy `ssh -p 2222 root@localhost`.
-    local worker="vungocduong@100.89.187.1"   # bailab-worker-61
+    local worker="hoangnv@100.102.20.26"   # bailab-worker-71
+    local worker_ssh_port=2209             # worker's own sshd -- verify with: ss -tlnp | grep sshd (trên worker)
     # Override per-workload via the TUNNEL_PORT env var (set it once in the
     # RunAI workload's environment variables so it persists across restarts
     # of that same workload -- no more editing this file by hand). Defaults
@@ -317,21 +358,28 @@ start_reverse_tunnel() {
     if pgrep -f "ssh.*-R ${port}:localhost:22" >/dev/null 2>&1; then
         ok "Reverse tunnel already running (port $port)"; return
     fi
+    if [[ ! -f "$DATA/.ssh/id_ed25519" ]]; then
+        warn "No tunnel key at $DATA/.ssh/id_ed25519 -- start_sshd should have created it, skipping tunnel"
+        return 1
+    fi
     # ProxyCommand bắt buộc: userspace-networking nên outbound tới tailnet
-    # phải đi qua `tailscale nc` (socket mặc định trong /var/run, riêng theo
-    # container nên không cần chỉ định socket khác nhau giữa các workload).
-    # Auth bằng SSH key (/home/data/.ssh/id_ed25519, persistent qua restart,
-    # dùng chung được vì worker chỉ cần trust đúng public key).
+    # không có kernel route -- phải đi qua SOCKS5 proxy mà tailscaled expose
+    # (--socks5-server, xem start_tailscale). Dùng ncat vì syntax SOCKS5 ổn
+    # định hơn socat (đã thử socat và fail: "socksport not supported").
+    # Auth bằng SSH key (/home/data/.ssh/id_ed25519, persistent qua restart) --
+    # public key của nó phải có trong ~/.ssh/authorized_keys của worker.
     # Vòng while tự reconnect khi tunnel đứt.
     nohup bash -c "while true; do
-        ssh -i /home/data/.ssh/id_ed25519 -o ProxyCommand='tailscale nc %h %p' \
+        ssh -i '$DATA/.ssh/id_ed25519' \
+            -o ProxyCommand='ncat --proxy 127.0.0.1:1055 --proxy-type socks5 %h %p' \
             -o StrictHostKeyChecking=no \
             -o ServerAliveInterval=30 -o ServerAliveCountMax=3 \
             -o ExitOnForwardFailure=yes \
+            -p ${worker_ssh_port} \
             -R ${port}:localhost:22 ${worker} -N
         sleep 5
     done" > "$DATA/tunnel-${wid}.log" 2>&1 &
-    ok "Reverse tunnel → ${worker} (trên worker: ssh -p ${port} root@localhost)"
+    ok "Reverse tunnel → ${worker}:${worker_ssh_port} (trên worker: ssh -p ${port} root@localhost)"
 }
 
 
