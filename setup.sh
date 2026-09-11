@@ -291,21 +291,15 @@ start_tailscale() {
         info "Installing tailscale..."
         curl -fsSL https://tailscale.com/install.sh | sh -s -- -q
     fi
-    # Multiple workloads can share this same host path (same /home/data),
-    # so the tailscale state file -- which holds the node's private identity,
-    # not just a display name -- MUST be unique per workload. Two containers
-    # sharing one state file would both authenticate as the same tailnet
-    # node and fight each other. Key it off TUNNEL_PORT when explicitly set;
-    # otherwise use the plain (unsuffixed) state file, since that's what the
-    # original pod already registered under -- renaming it would orphan an
-    # already-authenticated node and force re-auth for no reason.
-    local wid="${TUNNEL_PORT:-default}"
-    local state_file
-    if [[ -n "${TUNNEL_PORT:-}" ]]; then
-        state_file="$DATA/tailscale-state-${TUNNEL_PORT}.json"
-    else
-        state_file="$DATA/tailscale-state.json"
-    fi
+    # Pinned to this one workload (duyanh5-0-0) -- no TUNNEL_PORT
+    # indirection: that env var is only exported into interactive/login
+    # shells on this pod, so a non-interactive run would silently miss it
+    # and fall back to the wrong state file. The state file holds the
+    # node's private identity (not just a display name), so pointing at
+    # the wrong one either orphans the already-authenticated node or, if
+    # two workloads ever did share it, makes them fight over one identity.
+    local wid=2225
+    local state_file="$DATA/tailscale-state.json"
     # /var/run (where tailscaled's default control socket lives) is
     # per-container, NOT part of the shared host path, so multiple
     # tailscaled instances across workloads don't need separate sockets --
@@ -346,15 +340,16 @@ start_tailscale() {
 start_reverse_tunnel() {
     # Inbound TCP tới Tailscale IP của pod bị timeout (tailscaled chạy
     # userspace-networking, chỉ có DERP relay) — máy ngoài SSH vào pod
-    # qua reverse tunnel này: trên worker chạy `ssh -p 2222 root@localhost`.
+    # qua reverse tunnel này: trên worker chạy `ssh -p 2225 root@localhost`.
     local worker="hoangnv@100.102.20.26"   # bailab-worker-71
     local worker_ssh_port=2209             # worker's own sshd -- verify with: ss -tlnp | grep sshd (trên worker)
-    # Override per-workload via the TUNNEL_PORT env var (set it once in the
-    # RunAI workload's environment variables so it persists across restarts
-    # of that same workload -- no more editing this file by hand). Defaults
-    # to 2222 for backwards compatibility with the original pod.
-    local port="${TUNNEL_PORT:-2222}"
-    local wid="${TUNNEL_PORT:-default}"
+    # Pinned to 2225 for this one workload (duyanh5-0-0) -- was previously
+    # read from the TUNNEL_PORT env var, but that only gets exported into
+    # interactive/login shells on this pod, so a script invoked
+    # non-interactively (e.g. over ssh without a login shell) would see it
+    # unset and silently fall back to the wrong port.
+    local port=2225
+    local wid=2225
     if pgrep -f "ssh.*-R ${port}:localhost:22" >/dev/null 2>&1; then
         ok "Reverse tunnel already running (port $port)"; return
     fi
